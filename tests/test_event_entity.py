@@ -188,6 +188,7 @@ class TestCoordinatorPushCallbacks:
         coordinator = ComelitLocalCoordinator.__new__(ComelitLocalCoordinator)
         coordinator.hass = MagicMock()
         coordinator._push_callbacks = {}
+        coordinator._last_ring_event_mono = None
         return coordinator
 
     def test_add_push_callback_registers(self):

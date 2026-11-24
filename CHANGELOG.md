@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.2
+
+### Bug fixes
+
+- **Ring event fires immediately** — the `ring` event (and the ringing binary sensor) no longer waits for the passive video session to come up (~4 s). A ring is announced the moment the device signals it, even if video then fails to start. Duplicate rings within 5 s are suppressed
+- **Last Ring Snapshot no longer black** — the first decoded frame of an inbound session is pure black. The snapshot is now picked by sampling the first ~2.5 s of video and keeping the best frame (contrast/brightness score); black frames are never announced while the window is open, so automations waiting on the image entity are not woken by them
+- **Missed rings after long idle** — the device-side VIP registration could lapse after many hours even with a healthy TCP link. The connection and CTPP registration are now refreshed every 15 minutes while idle (skipped during calls/video); reconnects are serialized
+
+### Maintenance
+
+- New `snapshot.py` module with tests; image entity updates on snapshot changes instead of on ring events
+
 ## 1.5.1
 
 ### Bug fixes

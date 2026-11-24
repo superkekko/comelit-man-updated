@@ -79,6 +79,11 @@ def _make_coordinator(*, with_client: bool = False) -> ComelitLocalCoordinator:
     coordinator._last_ring_mono = None
     coordinator._inbound_answered = False
     coordinator._pending_inbound_ring = None
+    coordinator._last_ring_event_mono = None
+    coordinator._snapshot_task = None
+    coordinator._snapshot_callbacks = {}
+    coordinator._refresh_task = None
+    coordinator._reconnect_lock = asyncio.Lock()
     coordinator.async_request_refresh = AsyncMock()
     coordinator.async_set_updated_data = MagicMock()
     coordinator.logger = MagicMock()
@@ -1482,7 +1487,8 @@ class TestOnRingDuringVideo:
         coord, events = self._coord_with_events()
         coord._on_inbound_ring("SB100001", 0x27EEAB1C)
         coord._on_ring_during_video("SB100001", 0x27EEAB1C)
-        assert events == []  # inbound path fires its event later, after video is ready
+        # the inbound path fired the ring at once; the mid-call copy is a retransmit
+        assert [e.event_type for e in events] == ["ring"]
 
     def test_records_ring_recency_and_clears_answered(self):
         coord, events = self._coord_with_events()
@@ -1491,22 +1497,17 @@ class TestOnRingDuringVideo:
         assert coord._last_ring_mono is not None
         assert coord._inbound_answered is False
 
-    def test_warm_frame_updates_snapshot(self):
+    def test_active_session_schedules_snapshot_sampling(self):
         coord, events = self._coord_with_events()
-        session = MagicMock()
-        session.rtp_receiver.latest_frame = b"\xff\xd8warm"
-        coord._video_session = session
+        coord._video_session = MagicMock()
         coord._on_ring_during_video("SB100001", 0x27EEAB1C)
-        assert coord._last_ring_snapshot == b"\xff\xd8warm"
+        coord.config_entry.async_create_background_task.assert_called_once()
 
-    def test_no_frame_leaves_snapshot(self):
+    def test_no_session_does_not_schedule_snapshot(self):
         coord, events = self._coord_with_events()
-        coord._last_ring_snapshot = b"\xff\xd8old"
-        session = MagicMock()
-        session.rtp_receiver.latest_frame = None
-        coord._video_session = session
+        coord._video_session = None
         coord._on_ring_during_video("SB100001", 0x27EEAB1C)
-        assert coord._last_ring_snapshot == b"\xff\xd8old"
+        coord.config_entry.async_create_background_task.assert_not_called()
 
     def test_no_session_still_fires(self):
         """Session may have just torn down — event still fires."""
@@ -1688,42 +1689,10 @@ class TestAsyncStartInboundVideo:
         assert coord._video_session is session
         assert coord._video_ready_event.is_set()
         coord._rtsp_server.mark_ready.assert_called_once()
-        # ring fires only after video is flowing
-        assert [e.event_type for e in events] == ["ring"]
+        # the ring event itself fires from _on_inbound_ring, not from here
+        assert events == []
         assert coord._pending_inbound_ring == "SB100001"
-
-    @pytest.mark.asyncio
-    async def test_snapshot_captured_before_ring(self):
-        coord, events = self._coord()
-        session = self._session(frame=b"\xff\xd8warm")
-
-        with patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=session):
-            await coord.async_start_inbound_video("SB100001", 0x1234)
-
-        assert coord.last_ring_snapshot == b"\xff\xd8warm"
-
-    @pytest.mark.asyncio
-    async def test_snapshot_awaited_when_no_warm_frame(self):
-        coord, _events = self._coord()
-        session = self._session(frame=None)
-        session.rtp_receiver.get_jpeg_frame = AsyncMock(return_value=b"\xff\xd8fresh")
-
-        with patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=session):
-            await coord.async_start_inbound_video("SB100001", 0x1234)
-
-        assert coord.last_ring_snapshot == b"\xff\xd8fresh"
-
-    @pytest.mark.asyncio
-    async def test_snapshot_failure_is_tolerated(self):
-        coord, events = self._coord()
-        session = self._session(frame=None)
-        session.rtp_receiver.get_jpeg_frame = AsyncMock(side_effect=TimeoutError)
-
-        with patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=session):
-            await coord.async_start_inbound_video("SB100001", 0x1234)
-
-        assert coord.last_ring_snapshot is None
-        assert [e.event_type for e in events] == ["ring"]
+        coord.config_entry.async_create_background_task.assert_called_once()  # snapshot sampling
 
     @pytest.mark.asyncio
     async def test_backchannel_queue_attached(self):
@@ -1812,7 +1781,7 @@ class TestAsyncStartInboundVideo:
             await coord.async_start_inbound_video("SB100001", 0x1234)
 
         assert coord._video_session is session
-        assert [e.event_type for e in events] == ["ring"]
+        assert events == []
 
 
 class TestCoordinatorRemainingPaths:
@@ -1846,3 +1815,181 @@ class TestCoordinatorRemainingPaths:
 
         with pytest.raises(UpdateFailed, match="without a device configuration"):
             await coord._async_update_data()
+
+
+class TestRingSnapshotAndRefresh:
+    def test_add_snapshot_callback_register_and_remove(self):
+        coord = _make_coordinator()
+        cb = MagicMock()
+        remove = coord.add_snapshot_callback(cb)
+        assert cb in coord._snapshot_callbacks
+        remove()
+        assert cb not in coord._snapshot_callbacks
+
+    def test_duplicate_ring_suppressed_within_window(self):
+        coord = _make_coordinator()
+        events = []
+        coord._push_callbacks = {events.append: None}
+        from custom_components.comelit_man.models import PushEvent
+
+        coord._on_push_event(PushEvent(event_type="ring"))
+        coord._on_push_event(PushEvent(event_type="ring"))
+        assert [e.event_type for e in events] == ["ring"]
+
+    def test_ring_allowed_after_window(self):
+        coord = _make_coordinator()
+        events = []
+        coord._push_callbacks = {events.append: None}
+        from custom_components.comelit_man.models import PushEvent
+
+        coord._on_push_event(PushEvent(event_type="ring"))
+        coord._last_ring_event_mono -= 10
+        coord._on_push_event(PushEvent(event_type="ring"))
+        assert len(events) == 2
+
+    @pytest.mark.asyncio
+    async def test_capture_ring_snapshot_stores_frame_and_notifies(self):
+        coord = _make_coordinator()
+        cb = MagicMock()
+        coord._snapshot_callbacks = {cb: None}
+        session = MagicMock()
+        session.active = True
+        session.rtp_receiver.latest_frame = b"frame"
+        coord._video_session = session
+
+        async def fake_capture(get_frame, is_active, on_best):
+            assert get_frame() == b"frame"
+            assert is_active() is True
+            on_best(b"frame", 20.0)
+            return b"frame", 20.0
+
+        with patch("custom_components.comelit_man.coordinator.capture_best_frame", fake_capture):
+            await coord._capture_ring_snapshot(session)
+
+        assert coord._last_ring_snapshot == b"frame"
+        cb.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_capture_ring_snapshot_survives_failures(self):
+        coord = _make_coordinator()
+        session = MagicMock()
+        session.rtp_receiver = None
+
+        async def boom(*a, **k):
+            raise RuntimeError("x")
+
+        with patch("custom_components.comelit_man.coordinator.capture_best_frame", boom):
+            await coord._capture_ring_snapshot(session)  # must not raise
+
+        async def none(get_frame, is_active, on_best):
+            assert get_frame() is None
+            return None, -1.0
+
+        async def black(get_frame, is_active, on_best):
+            return b"b", 1.0
+
+        for fn in (none, black):
+            with patch("custom_components.comelit_man.coordinator.capture_best_frame", fn):
+                await coord._capture_ring_snapshot(session)
+
+    @pytest.mark.asyncio
+    async def test_snapshot_callback_error_is_isolated(self):
+        coord = _make_coordinator()
+        coord._snapshot_callbacks = {MagicMock(side_effect=RuntimeError("x")): None}
+        session = MagicMock()
+
+        async def fake_capture(get_frame, is_active, on_best):
+            on_best(b"f", 10.0)
+            return b"f", 10.0
+
+        with patch("custom_components.comelit_man.coordinator.capture_best_frame", fake_capture):
+            await coord._capture_ring_snapshot(session)
+        assert coord._last_ring_snapshot == b"f"
+
+    @pytest.mark.asyncio
+    async def test_schedule_snapshot_cancels_previous(self):
+        coord = _make_coordinator()
+        old = MagicMock()
+        old.done.return_value = False
+        coord._snapshot_task = old
+        coord._capture_ring_snapshot = MagicMock(return_value=None)
+        coord._schedule_snapshot(MagicMock())
+        old.cancel.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_refresh_skipped_when_notifications_disabled(self):
+        coord = _make_coordinator(with_client=True)
+        coord.config_entry.options = {"enable_notifications": False}
+        coord._reconnect_lock = asyncio.Lock()
+        coord._reconnect = AsyncMock()
+        await coord._refresh_registration()
+        coord._reconnect.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refresh_skipped_when_disconnected_or_busy(self):
+        coord = _make_coordinator(with_client=True)
+        coord._reconnect = AsyncMock()
+        coord._client.connected = False
+        await coord._refresh_registration()
+        coord._client.connected = True
+        coord._video_session = MagicMock()
+        await coord._refresh_registration()
+        coord._video_session = None
+        async with coord._video_start_lock:
+            await coord._refresh_registration()
+        coord._reconnect.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refresh_reconnects_when_idle(self):
+        coord = _make_coordinator(with_client=True)
+        coord._reconnect = AsyncMock()
+        await coord._refresh_registration()
+        coord._reconnect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_refresh_loop_survives_errors(self):
+        coord = _make_coordinator(with_client=True)
+        calls = 0
+
+        async def flaky():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("boom")
+            raise asyncio.CancelledError
+
+        coord._refresh_registration = flaky
+        with (
+            patch("custom_components.comelit_man.coordinator.VIP_REFRESH_INTERVAL", 0.001),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await coord._refresh_loop()
+        assert calls == 2
+
+    @pytest.mark.asyncio
+    async def test_start_refresh_idempotent(self):
+        coord = _make_coordinator()
+        coord._refresh_registration = AsyncMock()
+        coord._start_refresh()
+        first = coord._refresh_task
+        coord._start_refresh()
+        assert coord._refresh_task is first
+        first.cancel()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_is_serialized(self):
+        coord = _make_coordinator()
+        coord._reconnect_lock = asyncio.Lock()
+        running = 0
+        peak = 0
+
+        async def fake():
+            nonlocal running, peak
+            running += 1
+            peak = max(peak, running)
+            await asyncio.sleep(0.01)
+            running -= 1
+
+        coord._do_reconnect = fake
+        await asyncio.gather(coord._reconnect(), coord._reconnect())
+        assert peak == 1
