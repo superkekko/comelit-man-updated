@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from custom_components.comelit_man.image import LastRingImage, async_setup_entry
-from custom_components.comelit_man.models import DeviceConfig, Door, PushEvent
+from custom_components.comelit_man.models import DeviceConfig, Door
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -102,14 +102,14 @@ class TestLastRingImage:
         assert await entity.async_image() is None
 
     @pytest.mark.asyncio
-    async def test_added_to_hass_registers_push_callback(self):
+    async def test_added_to_hass_registers_snapshot_callback(self):
         entity = _make_entity()
         remove = MagicMock()
-        entity.coordinator.add_push_callback = MagicMock(return_value=remove)
+        entity.coordinator.add_snapshot_callback = MagicMock(return_value=remove)
 
         await entity.async_added_to_hass()
 
-        entity.coordinator.add_push_callback.assert_called_once_with(entity._on_push)
+        entity.coordinator.add_snapshot_callback.assert_called_once_with(entity._on_snapshot)
         assert entity._remove_push_cb is remove
 
     @pytest.mark.asyncio
@@ -128,16 +128,9 @@ class TestLastRingImage:
         entity = _make_entity()
         await entity.async_will_remove_from_hass()  # must not raise
 
-    def test_on_push_ring_updates_state(self):
+    def test_on_snapshot_updates_state(self):
         entity = _make_entity()
         with patch.object(entity, "async_write_ha_state") as write_state:
-            entity._on_push(PushEvent(event_type="ring", apt_address="SB100001", timestamp=0.0))
+            entity._on_snapshot()
         write_state.assert_called_once()
         assert entity._attr_image_last_updated is not None
-
-    def test_on_push_other_events_ignored(self):
-        entity = _make_entity()
-        with patch.object(entity, "async_write_ha_state") as write_state:
-            entity._on_push(PushEvent(event_type="missed_call", apt_address="SB100001", timestamp=0.0))
-            entity._on_push(PushEvent(event_type="door_opened", apt_address="SB100001", timestamp=0.0))
-        write_state.assert_not_called()

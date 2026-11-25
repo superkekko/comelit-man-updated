@@ -15,7 +15,6 @@ if TYPE_CHECKING:
 
 from .coordinator import ComelitLocalConfigEntry, ComelitLocalCoordinator
 from .entity import ComelitEntity
-from .models import PushEvent
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -38,7 +37,8 @@ async def async_setup_entry(
 class LastRingImage(ComelitEntity, ImageEntity):
     """Stores the JPEG snapshot captured when the last ring started passive video.
 
-    Updated only by async_start_inbound_video, before the ring event fires.
+    Updated by the coordinator's best-frame sampling after each ring (the ring event
+    itself fires earlier, before any video frame exists).
     Never overwritten by outbound video initiation.
     """
 
@@ -61,17 +61,22 @@ class LastRingImage(ComelitEntity, ImageEntity):
         return self.coordinator.last_ring_snapshot
 
     async def async_added_to_hass(self) -> None:
-        """Register push callback to react to ring events."""
-        self._remove_push_cb = self.coordinator.add_push_callback(self._on_push)
+        """Register for snapshot updates."""
+        self._remove_push_cb = self.coordinator.add_snapshot_callback(self._on_snapshot)
 
     async def async_will_remove_from_hass(self) -> None:
-        """Unregister push callback."""
+        """Unregister the snapshot callback."""
         if self._remove_push_cb:
             self._remove_push_cb()
             self._remove_push_cb = None
 
-    def _on_push(self, event: PushEvent) -> None:
-        """Refresh state when a ring event fires (snapshot is already stored)."""
-        if event.event_type == "ring":
-            self._attr_image_last_updated = datetime.now(UTC)
-            self.async_write_ha_state()
+    def _on_snapshot(self) -> None:
+        """Refresh state when a (better) snapshot has been stored.
+
+        The ring event fires before any video frame exists, so the image is
+        updated separately, ~0.2-2.5 s later.  Automations that need the
+        picture should trigger on this entity's state change, or wait a few
+        seconds after the ring event.
+        """
+        self._attr_image_last_updated = datetime.now(UTC)
+        self.async_write_ha_state()

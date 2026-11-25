@@ -32,6 +32,7 @@ from .exceptions import AuthenticationError, DoorOpenError
 from .models import DeviceConfig, Door, PushEvent
 from .push import register_push, send_push_keepalive
 from .rtsp_server import LocalRtspServer
+from .snapshot import BLACK_THRESHOLD, capture_best_frame
 from .video_call import VideoCallSession
 from .vip_listener import VipEventListener
 
@@ -45,6 +46,18 @@ RING_DEDUP_WINDOW = 120.0
 # A device 0x1840/0x0000 (idle) counts as a missed call only when it follows
 # a ring this recently; otherwise it is video-teardown / CTPP-init tail.
 MISSED_CALL_WINDOW = 45.0
+# The ring event now fires as soon as the device rings (before video is up).
+# Two ring signals closer than this (e.g. 0x18C0 followed by 0x1860/0x0001,
+# or a device retransmit with a new timestamp) are one physical ring.
+RING_EVENT_SUPPRESS = 5.0
+# While idle, re-register with the device this often (full reconnect + CTPP
+# init, the same sequence that runs at HA startup).  Observed on a 6741W: rings
+# are registered right after a restart and after ~35 min of idle, but a ring
+# after ~18 h idle was never seen, with the TCP link healthy (push keepalive
+# fine, no disconnect logged) — i.e. the device-side VIP registration lapses
+# silently.  A periodic fresh registration bounds how stale it can get.
+# Set to 0 to disable.
+VIP_REFRESH_INTERVAL = 15 * 60
 
 
 class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
@@ -94,12 +107,22 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # (ack_ts = init_ts + 0x01010000, PCAP-verified).
         self._ctpp_init_ts: int = 0
         self._keepalive_task: asyncio.Task[None] | None = None
+        # Periodic re-registration (see VIP_REFRESH_INTERVAL).  Lives outside
+        # _start/_cancel_keepalive: _reconnect() cancels those, and the refresh
+        # task calls _reconnect(), so it must not be one of the tasks it cancels.
+        self._refresh_task: asyncio.Task[None] | None = None
+        self._reconnect_lock: asyncio.Lock = asyncio.Lock()
         # Tracks whether we were connected on the last health-check so
         # disconnect / reconnect are logged exactly once per transition.
         self._connection_lost: bool = False
         # Last JPEG snapshot captured when passive inbound video started.
         # Set before the ring event fires; never overwritten by outbound video.
         self._last_ring_snapshot: bytes | None = None
+        # Best-frame sampling task for the current ring + listeners that are
+        # told when the snapshot changes (the image entity).
+        self._snapshot_task: asyncio.Task[None] | None = None
+        self._snapshot_callbacks: dict[Callable[[], None], None] = {}
+        self._last_ring_event_mono: float | None = None
         # Ring dedup + missed-call state.  Lives here (not in the VIP
         # listener) because the listener is recreated after every video
         # session — listener-local state would be wiped while the device
@@ -210,6 +233,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             _LOGGER.info("VIP event listener disabled via options")
 
         self._start_keepalive()
+        self._start_refresh()
 
         # Start persistent RTSP server so go2rtc can connect immediately
         if not self._rtsp_server:
@@ -227,6 +251,11 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         )
 
     async def _reconnect(self) -> None:
+        """Tear down old connection and re-establish everything (serialized)."""
+        async with self._reconnect_lock:
+            await self._do_reconnect()
+
+    async def _do_reconnect(self) -> None:
         """Tear down old connection and re-establish everything."""
         self._cancel_keepalive()
         # Stop any active video session before disconnecting — a concurrent
@@ -291,8 +320,52 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         ir.async_delete_issue(self.hass, DOMAIN, "auth_failed")
         _LOGGER.info("Comelit reconnected successfully")
 
+    def _start_refresh(self) -> None:
+        """Start the periodic VIP re-registration task (once)."""
+        if VIP_REFRESH_INTERVAL <= 0:
+            return
+        if self._refresh_task and not self._refresh_task.done():
+            return
+        self._refresh_task = asyncio.create_task(self._refresh_loop())
+
+    async def _refresh_loop(self) -> None:
+        """Every VIP_REFRESH_INTERVAL seconds, re-register while idle."""
+        while True:
+            await asyncio.sleep(VIP_REFRESH_INTERVAL)
+            try:
+                await self._refresh_registration()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Never let one failed refresh kill the loop; the 30 s health
+                # check reconnects if the client is really gone.
+                _LOGGER.warning("Periodic VIP refresh failed", exc_info=True)
+
+    async def _refresh_registration(self) -> None:
+        """Re-establish the connection + CTPP registration if nothing is going on."""
+        if not self.config_entry.options.get(CONF_ENABLE_NOTIFICATIONS, True):
+            return
+        if not self._client or not self._client.connected:
+            return  # the health check owns reconnects
+        if self._video_session is not None or self._video_start_lock.locked():
+            _LOGGER.debug("VIP refresh skipped: call/video in progress")
+            return
+        async with self._video_start_lock:
+            # Hold the lock so an inbound ring can't start a video session on
+            # the connection we are about to replace.
+            if self._video_session is not None:
+                return
+            _LOGGER.info(
+                "Refreshing VIP registration (periodic, every %d min)",
+                VIP_REFRESH_INTERVAL // 60,
+            )
+            await self._reconnect()
+
     async def async_shutdown(self) -> None:
         """Disconnect from the device."""
+        if self._refresh_task and not self._refresh_task.done():
+            self._refresh_task.cancel()
+        self._refresh_task = None
         self._cancel_keepalive()
         await self.async_stop_video()
         if self._vip_listener:
@@ -344,8 +417,24 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             except Exception:
                 _LOGGER.exception("Error in video state change callback")
 
+    def add_snapshot_callback(self, callback: Callable[[], None]) -> Callable[[], None]:
+        """Register a callback invoked whenever the ring snapshot changes."""
+        self._snapshot_callbacks[callback] = None
+
+        def _remove() -> None:
+            self._snapshot_callbacks.pop(callback, None)
+
+        return _remove
+
     def _on_push_event(self, event: PushEvent) -> None:
         """Dispatch a push event to all registered callbacks."""
+        if event.event_type == "ring":
+            now = time.monotonic()
+            last = self._last_ring_event_mono
+            if last is not None and now - last < RING_EVENT_SUPPRESS:
+                _LOGGER.debug("Ring event suppressed (duplicate within %.1fs)", now - last)
+                return
+            self._last_ring_event_mono = now
         for cb in list(self._push_callbacks):
             try:
                 cb(event)
@@ -539,6 +628,17 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         self._last_ring_mono = now
         self._inbound_answered = False
         _LOGGER.debug("Inbound ring: entrance=%s ring_ts=0x%08X", entrance_addr, ring_ts)
+        # Fire the ring NOW.  Previously it waited for the passive video
+        # session to come up (~4 s) and was lost entirely, leaving only a
+        # missed_call, whenever the video negotiation failed.  The snapshot
+        # follows a moment later via the image entity.
+        self._on_push_event(
+            PushEvent(
+                event_type="ring",
+                apt_address=entrance_addr,
+                timestamp=time.time(),
+            )
+        )
         self.config_entry.async_create_background_task(
             self.hass,
             self.async_start_inbound_video(entrance_addr, ring_ts),
@@ -562,12 +662,11 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         self._last_ring_mono = now
         self._inbound_answered = False
         self._pending_inbound_ring = entrance_addr
-        # Video is already flowing, so a warm frame makes the snapshot free.
+        # Video is already flowing, so a warm frame is available at once;
+        # keep sampling briefly in case the visitor only just stepped in view.
         session = self._video_session
-        if session is not None and session.rtp_receiver is not None:
-            frame = session.rtp_receiver.latest_frame
-            if frame is not None:
-                self._last_ring_snapshot = frame
+        if session is not None:
+            self._schedule_snapshot(session)
         _LOGGER.info("Ring during active video (entrance=%s ring_ts=0x%08X)", entrance_addr, ring_ts)
         self._on_push_event(
             PushEvent(
@@ -660,25 +759,52 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             if self._rtsp_server:
                 self._rtsp_server.mark_ready()
             await self._notify_video_state_change()
-            # Capture snapshot before firing ring so the image entity is ready
-            # when automations react to the event.
-            if session.rtp_receiver is not None:
-                snapshot = session.rtp_receiver.latest_frame
-                if snapshot is None:
-                    with contextlib.suppress(Exception):
-                        snapshot = await asyncio.wait_for(session.rtp_receiver.get_jpeg_frame(), timeout=2.0)
-                if snapshot is not None:
-                    self._last_ring_snapshot = snapshot
-            # Fire ring AFTER video is flowing so automations see the stream
+            # The ring event already fired when the device rang (see
+            # _on_inbound_ring).  Pick the snapshot from the first seconds of
+            # video: the very first decoded frame is black.
             self._pending_inbound_ring = entrance_addr
-            self._on_push_event(
-                PushEvent(
-                    event_type="ring",
-                    apt_address=entrance_addr,
-                    timestamp=time.time(),
-                )
+            self._schedule_snapshot(session)
+            _LOGGER.info("Inbound video ready (entrance=%s)", entrance_addr)
+
+    def _schedule_snapshot(self, session: VideoCallSession) -> None:
+        """Start (or restart) best-frame sampling for the current ring."""
+        if self._snapshot_task and not self._snapshot_task.done():
+            self._snapshot_task.cancel()
+        self._snapshot_task = self.config_entry.async_create_background_task(
+            self.hass, self._capture_ring_snapshot(session), "comelit-ring-snapshot"
+        )
+
+    async def _capture_ring_snapshot(self, session: VideoCallSession) -> None:
+        """Sample the first seconds of video and keep the best frame."""
+
+        def _get_frame() -> bytes | None:
+            receiver = session.rtp_receiver
+            return receiver.latest_frame if receiver is not None else None
+
+        def _on_best(frame: bytes, score: float) -> None:
+            self._last_ring_snapshot = frame
+            _LOGGER.debug("Ring snapshot updated (%d bytes, score=%.1f)", len(frame), score)
+            for cb in list(self._snapshot_callbacks):
+                try:
+                    cb()
+                except Exception:
+                    _LOGGER.exception("Error in snapshot callback")
+
+        try:
+            best, score = await capture_best_frame(
+                _get_frame,
+                lambda: session.active and self._video_session is session,
+                _on_best,
             )
-            _LOGGER.info("Inbound video ready, ring fired (entrance=%s)", entrance_addr)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            _LOGGER.warning("Ring snapshot capture failed", exc_info=True)
+            return
+        if best is None:
+            _LOGGER.warning("Ring snapshot: no video frame arrived")
+        elif score < BLACK_THRESHOLD:
+            _LOGGER.warning("Ring snapshot: only black frames received (best score %.1f)", score)
 
     async def async_answer_inbound(self) -> None:
         """Answer an active passive inbound call — send answer signals, start audio."""
