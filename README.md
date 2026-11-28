@@ -1,6 +1,8 @@
 ﻿# Comelit Man
 
-Home Assistant custom component for the **Comelit 6701W** WiFi video intercom. Communicates via the ICONA Bridge TCP protocol — no cloud required.
+Home Assistant custom component for the **Comelit 6701W / 6741W** WiFi video intercom. Communicates via the ICONA Bridge TCP protocol — no cloud required.
+
+> **About this fork.** This repository ([superkekko/comelit-man-updated](https://github.com/superkekko/comelit-man-updated)) is a fork of [mnestrud/comelit-man](https://github.com/mnestrud/comelit-man), itself a fork of [antoiba86/hass-comelit-intercom-local](https://github.com/antoiba86/hass-comelit-intercom-local). Version **1.5.2** fixes missed doorbell rings and black ring snapshots, verified on a real 6741W (see [What's different in this fork](#whats-different-in-this-fork)).
 
 ## Features
 
@@ -9,12 +11,22 @@ Home Assistant custom component for the **Comelit 6701W** WiFi video intercom. C
 - **Two-way audio** — hear the entrance and talk back from the doorbell card (mic requires an HTTPS origin — see below)
 - **Doorbell events** — automations trigger on ring, missed call, or door opened; passive inbound video starts on ring without answering (other stations keep ringing until you do)
 - **Answer-station card** — built-in WebRTC player using HA's native signaling; works on the local URL and remotely via Nabu Casa TURN
-- **Last-ring snapshot** — image entity holding a JPEG captured as each ring's video starts
+- **Last-ring snapshot** — image entity holding the best JPEG from the first seconds of each ring's video (never the black first frame)
 - **100% local** — all call handling stays on your LAN; the cloud is only involved when you view remotely
+
+## What's different in this fork
+
+Changes in **1.5.2** on top of upstream 1.5.1:
+
+- **Ring is reported immediately.** `event.*_doorbell` fires `ring` (and `binary_sensor.*_ringing` turns on) the moment the intercom signals the call, instead of after the passive video session is up (~4 s). Rings are no longer lost if video fails to start; duplicates within 5 s are suppressed.
+- **No more black "Last Ring Snapshot".** The first decoded frame of a call is pure black. The snapshot is now picked from the first ~2.5 s of video by contrast/brightness score, and black frames are never published while sampling — so an automation waiting for the image to change is not triggered by a black frame.
+- **No more silent registration loss.** After many idle hours the intercom could stop delivering ring events even though the TCP link looked healthy. While idle, the connection and CTPP registration are now refreshed every 15 minutes (skipped during a call or video session), and reconnects are serialized.
+
+Full details in [CHANGELOG.md](CHANGELOG.md).
 
 ## Requirements
 
-- Comelit 6701W (or compatible ICONA Bridge device)
+- Comelit 6701W / 6741W (or compatible ICONA Bridge device)
 - Device accessible on your local network
 - Home Assistant 2026.2.3+
 
@@ -25,6 +37,7 @@ Home Assistant custom component for the **Comelit 6701W** WiFi video intercom. C
 | Device | Firmware | Notes |
 |--------|----------|-------|
 | Comelit 6701W | 2.x | All features — door open, video, doorbell events |
+| Comelit 6741W | — | Doorbell ring events, last-ring snapshot, live video, Answer (verified with this fork's 1.5.2) |
 
 **Likely compatible (same ICONA Bridge protocol):**
 - Other Comelit WiFi video door panels using the ICONA Bridge protocol on port 64100
@@ -73,7 +86,7 @@ Changing this setting reloads the integration automatically.
 ## Known limitations
 
 - **Single concurrent video session** — only one video stream can be active at a time. Starting a second session stops the first.
-- **WiFi sleep** — the 6701W disconnects from WiFi when idle (no active call). Wake it physically (ring the bell, or press a button) before testing network connectivity. The integration reconnects automatically once the device wakes.
+- **WiFi sleep** — unless the intercom's always-on WiFi DIP switch is enabled, it may disconnect from WiFi when idle. Wake it physically (ring the bell, or press a button) before testing network connectivity. The integration reconnects automatically once the device wakes. Enabling always-on WiFi is recommended for reliable ring notifications.
 - **No cloud** — requires direct LAN access to the device. Remote access via VPN or a reverse proxy is your responsibility.
 - **Fixed RTSP port** — the integration uses a fixed RTSP port (8557). If another process is using that port at HA startup, the video feed will not work. Change the port in HA configuration or free up 8557.
 - **Door open timing** — when video is active, pressing a door button opens the door then stops video after 10 seconds. This matches the Android app's behavior.
@@ -99,9 +112,9 @@ The integration does not persist any state outside the config entry, so no manua
 | `camera.comelit_intercom_<name>` | RTSP stream from each additional configured camera |
 | `event.comelit_intercom_doorbell` | Fires `ring`, `missed_call`, and `door_opened` events for automations |
 | `button.comelit_intercom_answer_doorbell` | Start two-way audio on an active inbound call |
-| `image.comelit_intercom_last_ring_snapshot` | JPEG captured from video as the last ring arrived |
+| `image.comelit_intercom_last_ring_snapshot` | Best JPEG from the first seconds of the last ring's video; its state changes when a usable frame is captured |
 | `lock.comelit_intercom_<door_name>` | Same relay as the door button, with lock semantics for HomeKit/voice |
-| `binary_sensor.comelit_intercom_ringing` | On for 30 s after a ring |
+| `binary_sensor.comelit_intercom_ringing` | On for 30 s after a ring (use it as an automation trigger with `to: "on"`) |
 | `binary_sensor.comelit_intercom_connectivity` | Diagnostic — connection health |
 | `sensor.comelit_intercom_last_ring` | Timestamp of the most recent ring (survives restarts) |
 | `sensor.comelit_intercom_ring_count` | Cumulative ring count (survives restarts) |
@@ -193,6 +206,44 @@ actions:
             uri: /lovelace/intercom
 ```
 
+**Photo of the visitor in a Telegram message (waits for a real frame):**
+
+The snapshot image entity updates a moment after the ring, once a non-black frame has been captured, so wait for it before sending. Falls back to a text-only alert if no new frame arrives:
+
+```yaml
+alias: "Doorbell — Telegram with photo"
+mode: single
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.comelit_intercom_ringing
+    to: "on"
+actions:
+  - wait_for_trigger:
+      - trigger: state
+        entity_id: image.comelit_intercom_last_ring_snapshot
+    timeout: "00:00:08"
+    continue_on_timeout: true
+  - choose:
+      - conditions: "{{ wait.trigger is not none }}"
+        sequence:
+          - delay: "00:00:01.5"
+          - action: image.snapshot
+            target:
+              entity_id: image.comelit_intercom_last_ring_snapshot
+            data:
+              filename: /media/tmp/doorbell_last.jpg
+          - action: telegram_bot.send_photo
+            data:
+              file: /media/tmp/doorbell_last.jpg
+              caption: "🔔 Someone is at the door"
+    default:
+      - action: telegram_bot.send_message
+        data:
+          message: "🔔 Someone is at the door (photo not available)"
+```
+
+The target folder must be allowed in HA's `allowlist_external_dirs` / media dirs.
+
 **Auto-start video on ring (opt-in):**
 
 If you want the video to start automatically when the doorbell rings:
@@ -223,6 +274,7 @@ The integration uses a **push-first, poll-for-health** model:
 |-----------|-------------|-----------|
 | VIP event listener | Receives doorbell ring, missed call, and door-opened events as binary messages on the CTPP channel | Instant (device pushes) |
 | FCM keepalive probe | Re-sends push-info registration every 90 s; device ACKs, keeping the idle TCP connection alive | Every 90 s |
+| VIP registration refresh | Tears down and re-establishes the connection and CTPP registration while idle, so ring delivery survives long idle periods | Every 15 min (skipped during calls) |
 | Health-check poll | Verifies the TCP connection is still alive; triggers reconnect if not | Every 30 s |
 | TCP disconnect callback | Schedules an immediate health-check when the client detects a TCP drop | Instant (on drop) |
 
@@ -291,6 +343,11 @@ Then restart HA. Debug logs include TCP connection events, channel opens, keepal
 
 Full history: [CHANGELOG.md](CHANGELOG.md). Recent highlights:
 
+### 1.5.2
+- **Ring event fires immediately** — no longer gated behind passive video start; duplicates within 5 s suppressed
+- **Last Ring Snapshot no longer black** — best frame chosen from the first ~2.5 s of video
+- **Missed rings after long idle fixed** — idle VIP registration refresh every 15 min; reconnects serialized
+
 ### 1.5.0
 - **Dedicated device user** — opt-in during setup: the integration creates its own account on the intercom and mints its own token, so Home Assistant and the Comelit app no longer kick each other off a shared identity
 - **Lock entities, ring sensors, per-caller doorbell entities** — doors are also locks (HomeKit/voice), last-ring + ring-count sensors restore across restarts, and each call origin gets its own event entity
@@ -310,6 +367,10 @@ Full history: [CHANGELOG.md](CHANGELOG.md). Recent highlights:
 
 ## Acknowledgments
 
+This project builds on the work of:
+- [mnestrud/comelit-man](https://github.com/mnestrud/comelit-man) — the integration this fork is based on
+- [antoiba86/hass-comelit-intercom-local](https://github.com/antoiba86/hass-comelit-intercom-local) by antoiba86 — the original integration
+
 Protocol knowledge derived from community reverse-engineering efforts:
 - [ha-component-comelit-intercom](https://github.com/nicolas-fricke/ha-component-comelit-intercom) by Nicolas Fricke
 - [comelit-client](https://github.com/madchicken/comelit-client) by Pierpaolo Follia
@@ -317,4 +378,4 @@ Protocol knowledge derived from community reverse-engineering efforts:
 
 ## License
 
-Apache 2.0
+Apache 2.0 — see [LICENSE](LICENSE). Original copyright and attribution of the upstream projects are retained.
